@@ -54,12 +54,16 @@ static float            threshold = 0.1;
 
 static int 			    capture_width = 0;
 static int			    capture_height = 0;
+static int              first_run = 1;
 
+// Data containers
 static unsigned char*   last_buf;               // Last sucessfull read from webcam.
 static unsigned char*   simplified_buf;         // Webcam monochrome image scalled down by scale.
 static float*           average_buf;            // Average monochrome image over last several frames.
+static unsigned char*   average_char_buf;       // unsigned char buffer with average_buf data in it.
 static unsigned char*   movment_buf;            // Diff between simplified_buf and average_buf.
 static unsigned char*   rgb_buf;                // last_buf converted to RGB colours.
+
 
 /**
   Convert from YUV422 format to RGB888. Formulae are described on http://en.wikipedia.org/wiki/YUV
@@ -101,6 +105,21 @@ static void YUV422toRGB888(int width, int height, unsigned char *src, unsigned c
   }
 }
 
+static void float_buf_to_char_buf (float* float_buf, unsigned char* char_buf, int image_width, int image_height, int num_of_col)
+{
+    int i = 0;
+    while (i < image_width * image_height * num_of_col) {
+        if (float_buf[i] > 255){
+            char_buf[i] = 255;
+        } else if (float_buf[i] < 0) {
+            char_buf[i] = 0;
+        } else {
+            char_buf[i] = float_buf[i];
+        }
+        i++;
+    }
+}
+
 static void write_JPEG_file (unsigned char* p_image_buffer, char* filename, int image_width, int image_height, int num_of_col)
 {
     // JPEG object
@@ -110,18 +129,21 @@ static void write_JPEG_file (unsigned char* p_image_buffer, char* filename, int 
     struct jpeg_error_mgr jerr;
     cinfo.err = jpeg_std_error(&jerr);
 
-    FILE * outfile;               /* target file */
     JSAMPROW row_pointer[1];      /* pointer to JSAMPLE row[s] */
 
     // initialize the JPEG compression object.
     jpeg_create_compress(&cinfo);
 
     // open file and set file as target.
+    FILE * outfile;               /* target file */
     if ((outfile = fopen(filename, "wb")) == NULL) {
         fprintf(stderr, "can't open %s\n", filename);
         exit(1);
     }
     jpeg_stdio_dest(&cinfo, outfile);
+    //unsigned char *mem = NULL;
+    //unsigned long mem_size = 0;
+    //jpeg_mem_dest(&cinfo, &mem, &mem_size);
 
     cinfo.image_width = image_width;      /* image width and height, in pixels */
     cinfo.image_height = image_height;
@@ -139,7 +161,7 @@ static void write_JPEG_file (unsigned char* p_image_buffer, char* filename, int 
     jpeg_set_quality(&cinfo, 70, TRUE /* limit to baseline-JPEG values */);
 
     jpeg_start_compress(&cinfo, TRUE);
-    int row_stride = image_width * num_of_col;   // 3 values per pixel.
+    int row_stride = image_width * num_of_col;
     while (cinfo.next_scanline < cinfo.image_height) {
         row_pointer[0] = &p_image_buffer[cinfo.next_scanline * row_stride];
         (void) jpeg_write_scanlines(&cinfo, row_pointer, 1);
@@ -147,6 +169,7 @@ static void write_JPEG_file (unsigned char* p_image_buffer, char* filename, int 
 
     jpeg_finish_compress(&cinfo);
     fclose(outfile);
+    //free(mem);
     jpeg_destroy_compress(&cinfo);
 }
 
@@ -179,6 +202,11 @@ static void init_buf()
         fprintf(stderr, "Out of memory\n");
         exit(EXIT_FAILURE);
     }
+    average_char_buf = malloc(sizeof(unsigned char) * capture_width * capture_height / (scale * scale));
+    if (!average_char_buf) {
+        fprintf(stderr, "Out of memory\n");
+        exit(EXIT_FAILURE);
+    }
     movment_buf = malloc(sizeof(unsigned char) * capture_width * capture_height / (scale * scale));
     if (!movment_buf) {
         fprintf(stderr, "Out of memory\n");
@@ -196,6 +224,7 @@ static void uninit_buf()
 {
     free(simplified_buf);
     free(average_buf);
+    free(average_char_buf);
     free(movment_buf);
     free(rgb_buf);
 }
@@ -240,10 +269,15 @@ static void update_movment()
         for(colum = 0; colum < capture_width; colum += scale){
             *tmp_movment = abs(*tmp_last - *tmp_average);
 
-            if ((*tmp_last > *tmp_average) & (*tmp_average < 255)) {
-                *tmp_average += threshold;
-            } else if ((*tmp_last < *tmp_average) & (*tmp_average > 0)) {
-                *tmp_average -= threshold;
+            if (first_run) {
+                printf("%i ", *tmp_last);
+                *tmp_average = *tmp_last;
+            } else {
+                if ((*tmp_last > *tmp_average) & (*tmp_average < 255)) {
+                    *tmp_average += threshold;
+                } else if ((*tmp_last < *tmp_average) & (*tmp_average > 0)) {
+                    *tmp_average -= threshold;
+                }
             }
 
             tmp_last++;
@@ -876,7 +910,7 @@ int main(int argc, char **argv)
                 break;
 
             case 't':
-                threshold = atoi(optarg);
+                threshold = atof(optarg);
                 break;
 
             default:
@@ -893,15 +927,22 @@ int main(int argc, char **argv)
     while (1) {
         mainloop();
         end = clock();
-        //printf("%d %d %d %f\n", begin, end, CLOCKS_PER_SEC, (float)(end - begin) / CLOCKS_PER_SEC );
-        if ((float)(end - begin) / CLOCKS_PER_SEC > .01) {
+        if ((float)(end - begin) / CLOCKS_PER_SEC > .1) {
             begin = clock();
             update_movment();
             display_image(movment_buf);
 
-            YUV422toRGB888(capture_width, capture_height, last_buf, rgb_buf);
-            write_JPEG_file(rgb_buf, "test.jpeg", capture_width, capture_height, 3);
-            write_JPEG_file(movment_buf, "test2.jpeg", capture_width / scale, capture_height / scale, 1);
+            //YUV422toRGB888(capture_width, capture_height, last_buf, rgb_buf);
+            //write_JPEG_file(rgb_buf, "peep_webcam.jpeg", capture_width, capture_height, 3);
+            
+            //write_JPEG_file(simplified_buf, "peep_simple.jpeg", capture_width / scale, capture_height / scale, 1);
+            
+            //float_buf_to_char_buf(average_buf, average_char_buf, capture_width / scale, capture_height / scale, 1);
+            //write_JPEG_file(average_char_buf, "peep_average.jpeg", capture_width / scale, capture_height / scale, 1);
+            
+            write_JPEG_file(movment_buf, "peep_movment.jpeg", capture_width / scale, capture_height / scale, 1);
+
+            first_run = 0;
         }
     }
     stop_capturing();
