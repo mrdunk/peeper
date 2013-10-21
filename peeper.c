@@ -22,12 +22,13 @@
 #include <sys/ioctl.h>
 #include <time.h>
 
+#include "jpeglib.h"
+
+
 #include <linux/videodev2.h>
 
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
 
-#define SCALE 16
-#define THRESHOLD 1
 
 enum io_method {
         IO_METHOD_READ,
@@ -48,12 +49,106 @@ static unsigned int     n_buffers;
 
 // Command line flags
 static int              force_format;
+static int              scale = 16;
+static float            threshold = 0.1;
 
-static int 			    capture_width;
-static int			    capture_height;
-static unsigned char*   last_buf;
-static unsigned char*   average_buf;
-static unsigned char*   movment_buf;
+static int 			    capture_width = 0;
+static int			    capture_height = 0;
+
+static unsigned char*   last_buf;               // Last sucessfull read from webcam.
+static unsigned char*   simplified_buf;         // Webcam monochrome image scalled down by scale.
+static float*           average_buf;            // Average monochrome image over last several frames.
+static unsigned char*   movment_buf;            // Diff between simplified_buf and average_buf.
+static unsigned char*   rgb_buf;                // last_buf converted to RGB colours.
+
+/**
+  Convert from YUV422 format to RGB888. Formulae are described on http://en.wikipedia.org/wiki/YUV
+  http://www.twam.info/linux/v4l2grab-grabbing-jpegs-from-v4l2-devices
+
+  \param width width of image
+  \param height height of image
+  \param src source
+  \param dst destination
+*/
+static void YUV422toRGB888(int width, int height, unsigned char *src, unsigned char *dst)
+{
+  int line, column;
+  unsigned char *py, *pu, *pv;
+  unsigned char *tmp = dst;
+
+  /* In this format each four bytes is two pixels. Each four bytes is two Y's, a Cb and a Cr. 
+     Each Y goes to one of the pixels, and the Cb and Cr belong to both pixels. */
+  py = src;
+  pu = src + 1;
+  pv = src + 3;
+
+  #define CLIP(x) ( (x)>=0xFF ? 0xFF : ( (x) <= 0x00 ? 0x00 : (x) ) )
+
+  for (line = 0; line < height; ++line) {
+    for (column = 0; column < width; ++column) {
+      *tmp++ = CLIP((double)*py + 1.402*((double)*pv-128.0));
+      *tmp++ = CLIP((double)*py - 0.344*((double)*pu-128.0) - 0.714*((double)*pv-128.0));
+      *tmp++ = CLIP((double)*py + 1.772*((double)*pu-128.0));
+
+      // increase py every time
+      py += 2;
+      // increase pu,pv every second time
+      if ((column & 1)==1) {
+        pu += 4;
+        pv += 4;
+      }
+    }
+  }
+}
+
+static void write_JPEG_file (unsigned char* p_image_buffer, char* filename, int image_width, int image_height, int num_of_col)
+{
+    // JPEG object
+    struct jpeg_compress_struct cinfo;
+
+    // JPEG error handler
+    struct jpeg_error_mgr jerr;
+    cinfo.err = jpeg_std_error(&jerr);
+
+    FILE * outfile;               /* target file */
+    JSAMPROW row_pointer[1];      /* pointer to JSAMPLE row[s] */
+
+    // initialize the JPEG compression object.
+    jpeg_create_compress(&cinfo);
+
+    // open file and set file as target.
+    if ((outfile = fopen(filename, "wb")) == NULL) {
+        fprintf(stderr, "can't open %s\n", filename);
+        exit(1);
+    }
+    jpeg_stdio_dest(&cinfo, outfile);
+
+    cinfo.image_width = image_width;      /* image width and height, in pixels */
+    cinfo.image_height = image_height;
+    cinfo.input_components = num_of_col;  /* # of color components per pixel */
+    if (num_of_col == 3){
+        cinfo.in_color_space = JCS_RGB;       /* colorspace of input image */
+    } else {
+        cinfo.in_color_space = JCS_GRAYSCALE;
+    }
+
+    // set other cinfo peramiters as default.
+    jpeg_set_defaults(&cinfo);
+
+    // set any non default cinfo oeramiters.
+    jpeg_set_quality(&cinfo, 70, TRUE /* limit to baseline-JPEG values */);
+
+    jpeg_start_compress(&cinfo, TRUE);
+    int row_stride = image_width * num_of_col;   // 3 values per pixel.
+    while (cinfo.next_scanline < cinfo.image_height) {
+        row_pointer[0] = &p_image_buffer[cinfo.next_scanline * row_stride];
+        (void) jpeg_write_scanlines(&cinfo, row_pointer, 1);
+    }
+
+    jpeg_finish_compress(&cinfo);
+    fclose(outfile);
+    jpeg_destroy_compress(&cinfo);
+}
 
 static void errno_exit(const char *s)
 {
@@ -74,42 +169,50 @@ static int xioctl(int fh, int request, void *arg)
 
 static void init_buf()
 {
-    last_buf = malloc(capture_width * capture_height / (SCALE * SCALE));
-    if (!last_buf) {
+    simplified_buf = malloc(sizeof(unsigned char) * capture_width * capture_height / (scale * scale));
+    if (!simplified_buf) {
         fprintf(stderr, "Out of memory\n");
         exit(EXIT_FAILURE);
     }
-    average_buf = malloc(capture_width * capture_height / (SCALE * SCALE));
-    if (!last_buf) {
+    average_buf = malloc(sizeof(float) * capture_width * capture_height / (scale * scale));
+    if (!average_buf) {
         fprintf(stderr, "Out of memory\n");
         exit(EXIT_FAILURE);
     }
-    movment_buf = malloc(capture_width * capture_height / (SCALE * SCALE));
-    if (!last_buf) {
+    movment_buf = malloc(sizeof(unsigned char) * capture_width * capture_height / (scale * scale));
+    if (!movment_buf) {
         fprintf(stderr, "Out of memory\n");
         exit(EXIT_FAILURE);
     }
+    rgb_buf = malloc(sizeof(unsigned char) * capture_width * capture_height * 3);
+    if (!rgb_buf) {
+        fprintf(stderr, "Out of memory\n");
+        exit(EXIT_FAILURE);
+    }
+
 }
 
 static void uninit_buf()
 {
-    free(last_buf);
+    free(simplified_buf);
     free(average_buf);
     free(movment_buf);
+    free(rgb_buf);
 }
 
-static void process_image(void *p, int size)
+static void process_image(const void *p, int size)
 {
+    last_buf = (unsigned char*)p;
     unsigned char *py, *pu, *pv;
     int row, colum;
     int val;
-    unsigned char *tmp = last_buf;
-    py = p;
-    pu = p + 1;
-    pv = p + 3;
+    unsigned char *tmp = simplified_buf;
+    py = (unsigned char*)p;
+    pu = (unsigned char*)p + 1;
+    pv = (unsigned char*)p + 3;
     for(row = 0; row < capture_height; ++row){
         for(colum = 0; colum < capture_width; ++colum){
-            if (!(colum % SCALE) & !(row % SCALE)) {
+            if (!(colum % scale) & !(row % scale)) {
                 // copy pixel into buffer
                 val = *py;  // + *pu + *pv;
                 *tmp = val;
@@ -129,18 +232,18 @@ static void process_image(void *p, int size)
 static void update_movment()
 {
     int row, colum;
-    unsigned char *tmp_last = last_buf;
-    unsigned char *tmp_average = average_buf;
+    unsigned char *tmp_last = simplified_buf;
+    float *tmp_average = average_buf;
     unsigned char *tmp_movment = movment_buf;
 
-    for(row = 0; row < capture_height; row += SCALE){
-        for(colum = 0; colum < capture_width; colum += SCALE){
+    for(row = 0; row < capture_height; row += scale){
+        for(colum = 0; colum < capture_width; colum += scale){
             *tmp_movment = abs(*tmp_last - *tmp_average);
 
             if ((*tmp_last > *tmp_average) & (*tmp_average < 255)) {
-                (*tmp_average)++;
+                *tmp_average += threshold;
             } else if ((*tmp_last < *tmp_average) & (*tmp_average > 0)) {
-                (*tmp_average)--;
+                *tmp_average -= threshold;
             }
 
             tmp_last++;
@@ -157,13 +260,13 @@ static void display_image(void *p_buffer)
     unsigned char *tmp = p_buffer;
     
     fprintf(stderr, "\n+");
-    for(colum = 0; colum < capture_width; colum += SCALE){
+    for(colum = 0; colum < capture_width; colum += scale){
         fprintf(stderr, "--");
     }
     fprintf(stderr, "+\n|");
-    for(row = 0; row < capture_height; row += SCALE){
+    for(row = 0; row < capture_height; row += scale){
         if (row) fprintf(stderr, "|\n|");
-        for(colum = 0; colum < capture_width; colum += SCALE){
+        for(colum = 0; colum < capture_width; colum += scale){
             val = *tmp;
             tmp++;
             if (val < 20) {
@@ -186,7 +289,7 @@ static void display_image(void *p_buffer)
         }
     }
     fprintf(stderr, "|\n+");
-    for(colum = 0; colum < capture_width; colum += SCALE){
+    for(colum = 0; colum < capture_width; colum += scale){
         fprintf(stderr, "--");
     }
     fprintf(stderr, "+\n");
@@ -635,6 +738,8 @@ static void init_device(void)
 
 	capture_width = fmt.fmt.pix.width;
 	capture_height = fmt.fmt.pix.height;
+    fprintf(stderr,"Image width set to %i by device %s.\n", capture_width, dev_name);
+    fprintf(stderr,"Image height set to %i by device %s.\n", capture_height, dev_name);
 }
 
 static void close_device(void)
@@ -681,11 +786,13 @@ static void usage(FILE *fp, int argc, char **argv)
                  "-r | --read          Use read() calls\n"
                  "-u | --userp         Use application allocated buffers\n"
                  "-f | --format        Force format to 640x480 YUYV\n"
+                 "-s | --scale         Divide raw webcam image by this value [%i]\n"
+                 "-t | --threshold     Rate at which changes in image are absorbed into the expected backround [%f]\n"
                  "",
-                 argv[0], dev_name);
+                 argv[0], dev_name, scale, threshold);
 }
 
-static const char short_options[] = "d:hmruofc:";
+static const char short_options[] = "d:hmruofs:t:";
 
 static const struct option
 long_options[] = {
@@ -695,6 +802,8 @@ long_options[] = {
         { "read",   no_argument,       NULL, 'r' },
         { "userp",  no_argument,       NULL, 'u' },
         { "format", no_argument,       NULL, 'f' },
+        { "scale",  required_argument, NULL, 's' },
+        { "threshold", required_argument, NULL, 't' },
         { 0, 0, 0, 0 }
 };
 
@@ -741,6 +850,14 @@ int main(int argc, char **argv)
             case 'f':
                 force_format++;
                 break;
+            
+            case 's':
+                scale = atoi(optarg);
+                break;
+
+            case 't':
+                threshold = atoi(optarg);
+                break;
 
             default:
                 usage(stderr, argc, argv);
@@ -761,6 +878,10 @@ int main(int argc, char **argv)
             begin = clock();
             update_movment();
             display_image(movment_buf);
+
+            YUV422toRGB888(capture_width, capture_height, last_buf, rgb_buf);
+            write_JPEG_file(rgb_buf, "test.jpeg", capture_width, capture_height, 3);
+            write_JPEG_file(movment_buf, "test2.jpeg", capture_width / scale, capture_height / scale, 1);
         }
     }
     stop_capturing();
