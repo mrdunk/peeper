@@ -253,44 +253,58 @@ static void update_movment()
     }
 }
 
+#define MAXSIZE 16
 static void display_image(void *p_buffer)
 {
     int row, colum;
     int val;
     unsigned char *tmp = p_buffer;
     
+    //int scale_remainder = 0;
+    //if (scale < MAXSIZE) {
+    //    scale_remainder = MAXSIZE - scale;
+    //}
+
     fprintf(stderr, "\n+");
     for(colum = 0; colum < capture_width; colum += scale){
-        fprintf(stderr, "--");
+        if (!(colum % MAXSIZE)) {
+            fprintf(stderr, "--");
+        }
     }
     fprintf(stderr, "+\n|");
     for(row = 0; row < capture_height; row += scale){
-        if (row) fprintf(stderr, "|\n|");
+        if (!(row % MAXSIZE)) {
+            if (row) fprintf(stderr, "|\n|");
+        }
         for(colum = 0; colum < capture_width; colum += scale){
-            val = *tmp;
-            tmp++;
-            if (val < 20) {
-                fprintf(stderr, "  ");
-            } else if ( val < 40) {
-                fprintf(stderr, "..");
-            } else if ( val < 60) {
-                fprintf(stderr, "--");
-            } else if ( val < 80) {
-                fprintf(stderr, "~~");
-            } else if ( val < 100) {
-                fprintf(stderr, "**");
-            } else if ( val < 150) {
-                fprintf(stderr, "xx");
-            } else if ( val < 200) {
-                fprintf(stderr, "XX");
-            } else {
-                fprintf(stderr, "##");
+            if (!(colum % MAXSIZE) & !(row % MAXSIZE)) {
+                val = *tmp;
+                if (val < 20) {
+                    fprintf(stderr, "  ");
+                } else if ( val < 40) {
+                    fprintf(stderr, "..");
+                } else if ( val < 60) {
+                    fprintf(stderr, "--");
+                } else if ( val < 80) {
+                    fprintf(stderr, "~~");
+                } else if ( val < 100) {
+                    fprintf(stderr, "**");
+                } else if ( val < 150) {
+                    fprintf(stderr, "xx");
+                } else if ( val < 200) {
+                    fprintf(stderr, "XX");
+                } else {
+                    fprintf(stderr, "##");
+                }
             }
+            tmp++;
         }
     }
     fprintf(stderr, "|\n+");
     for(colum = 0; colum < capture_width; colum += scale){
-        fprintf(stderr, "--");
+        if (!(colum % MAXSIZE)) {
+            fprintf(stderr, "--");
+        }
     }
     fprintf(stderr, "+\n");
 }
@@ -786,7 +800,7 @@ static void usage(FILE *fp, int argc, char **argv)
                  "-r | --read          Use read() calls\n"
                  "-u | --userp         Use application allocated buffers\n"
                  "-f | --format        Force format to 640x480 YUYV\n"
-                 "-s | --scale         Divide raw webcam image by this value [%i]\n"
+                 "-s | --scale         Raw image devided by this scale [%i]\n"
                  "-t | --threshold     Rate at which changes in image are absorbed into the expected backround [%f]\n"
                  "",
                  argv[0], dev_name, scale, threshold);
@@ -853,6 +867,12 @@ int main(int argc, char **argv)
             
             case 's':
                 scale = atoi(optarg);
+                if (!((scale == 1) | (scale == 2) | (scale == 4) | (scale == 8) | (scale == 16) |
+                      (scale == 32) | (scale == 64) | (scale == 128))) {
+                    fprintf(stderr, "--scale must be one of [1,2,4,8,16,32,64,128]\n\n");
+                    usage(stderr, argc, argv);
+                    exit(EXIT_FAILURE);
+                }
                 break;
 
             case 't':
