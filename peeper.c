@@ -1,6 +1,6 @@
 /*
  * Based on the V4L2 video capture example at
- * http://linuxtv.org/docs.php .
+ * http://linuxtv.org/downloads/v4l-dvb-apis/capture-example.html
  *
  * Works with v4l2 compatible webcam. (Not v4l.)
  */
@@ -28,7 +28,11 @@
 #include <linux/videodev2.h>
 
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
+#define BILLION  1000000000L
 
+#define R 0
+#define G 1
+#define B 2
 
 enum io_method {
         IO_METHOD_READ,
@@ -50,7 +54,8 @@ static unsigned int     n_buffers;
 // Command line flags
 static int              force_format;
 static int              scale = 16;
-static float            threshold = 0.1;
+static float            ave_thresh = 0.1;
+static int              mov_thresh = 20;
 
 static int 			    capture_width = 0;
 static int			    capture_height = 0;
@@ -58,12 +63,38 @@ static int              first_run = 1;
 
 // Data containers
 static unsigned char*   last_buf;               // Last sucessfull read from webcam.
-static unsigned char*   simplified_buf;         // Webcam monochrome image scalled down by scale.
 static float*           average_buf;            // Average monochrome image over last several frames.
 static unsigned char*   average_char_buf;       // unsigned char buffer with average_buf data in it.
-static unsigned char*   movment_buf;            // Diff between simplified_buf and average_buf.
+static unsigned char*   movment_buf;            // Diff between rgb_buf and average_buf.
 static unsigned char*   rgb_buf;                // last_buf converted to RGB colours.
 
+
+#include <openssl/sha.h>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
+#include <openssl/bio.h>
+#include <openssl/buffer.h>
+// http://www.ioncannon.net/programming/34/howto-base64-encode-with-cc-and-openssl/
+char *base64(const unsigned char *input, int length)
+{
+    BIO *bmem, *b64;
+    BUF_MEM *bptr;
+
+    b64 = BIO_new(BIO_f_base64());
+    bmem = BIO_new(BIO_s_mem());
+    b64 = BIO_push(b64, bmem);
+    BIO_write(b64, input, length);
+    BIO_flush(b64);
+    BIO_get_mem_ptr(b64, &bptr);
+
+    char *buff = (char *)malloc(bptr->length);
+    memcpy(buff, bptr->data, bptr->length-1);
+    buff[bptr->length-1] = 0;
+
+    BIO_free_all(b64);
+
+    return buff;
+}
 
 /**
   Convert from YUV422 format to RGB888. Formulae are described on http://en.wikipedia.org/wiki/YUV
@@ -179,6 +210,12 @@ static void errno_exit(const char *s)
         exit(EXIT_FAILURE);
 }
 
+static void process_image(const void *p, int size)
+{   
+    // Save pointer to last sucessfully filled v4l2 buffer.
+    last_buf = (unsigned char*)p;
+}
+
 static int xioctl(int fh, int request, void *arg)
 {
         int r;
@@ -192,17 +229,12 @@ static int xioctl(int fh, int request, void *arg)
 
 static void init_buf()
 {
-    simplified_buf = malloc(sizeof(unsigned char) * capture_width * capture_height / (scale * scale));
-    if (!simplified_buf) {
-        fprintf(stderr, "Out of memory\n");
-        exit(EXIT_FAILURE);
-    }
-    average_buf = malloc(sizeof(float) * capture_width * capture_height / (scale * scale));
+    average_buf = malloc(sizeof(float) * 3 * capture_width * capture_height / (scale * scale));
     if (!average_buf) {
         fprintf(stderr, "Out of memory\n");
         exit(EXIT_FAILURE);
     }
-    average_char_buf = malloc(sizeof(unsigned char) * capture_width * capture_height / (scale * scale));
+    average_char_buf = malloc(sizeof(unsigned char) * 3 * capture_width * capture_height / (scale * scale));
     if (!average_char_buf) {
         fprintf(stderr, "Out of memory\n");
         exit(EXIT_FAILURE);
@@ -222,67 +254,69 @@ static void init_buf()
 
 static void uninit_buf()
 {
-    free(simplified_buf);
     free(average_buf);
     free(average_char_buf);
     free(movment_buf);
     free(rgb_buf);
 }
 
-static void process_image(const void *p, int size)
-{
-    last_buf = (unsigned char*)p;
-    unsigned char *py, *pu, *pv;
+static void update_movment(unsigned char* _rgb_source_buf) {
     int row, colum;
-    int val;
-    unsigned char *tmp = simplified_buf;
-    py = (unsigned char*)p;
-    pu = (unsigned char*)p + 1;
-    pv = (unsigned char*)p + 3;
-    for(row = 0; row < capture_height; ++row){
-        for(colum = 0; colum < capture_width; ++colum){
-            if (!(colum % scale) & !(row % scale)) {
-                // copy pixel into buffer
-                val = *py;  // + *pu + *pv;
-                *tmp = val;
-                tmp++;
-            }
-            // increase py every time
-            py += 2;
-            // increase pu,pv every second time
-            if ((colum & 1)==1) {
-                pu += 4;
-                pv += 4;
-            }
-        }
-    }
-}
-
-static void update_movment()
-{
-    int row, colum;
-    unsigned char *tmp_last = simplified_buf;
     float *tmp_average = average_buf;
     unsigned char *tmp_movment = movment_buf;
 
-    for(row = 0; row < capture_height; row += scale){
-        for(colum = 0; colum < capture_width; colum += scale){
-            *tmp_movment = abs(*tmp_last - *tmp_average);
+    for(row = 0; row < capture_height; row++){
+        for(colum = 0; colum < capture_width; colum++){
+            if (!(row % scale) & !(colum % scale)) {
+                if (first_run) {
+                    // Copy the first frame into the average buffer.
+                    tmp_average[R] = _rgb_source_buf[R];
+                    tmp_average[G] = _rgb_source_buf[G];
+                    tmp_average[B] = _rgb_source_buf[B];
+                } else {
+                    // Slowly change the average buffer to match what is seen by the camera.
+                    if ((_rgb_source_buf[R] > tmp_average[R]) & (tmp_average[R] < 255)) {
+                        tmp_average[R] += ave_thresh;
+                    } else if ((_rgb_source_buf[R] < tmp_average[R]) & (tmp_average[R] > 0)) {
+                        tmp_average[R] -= ave_thresh;
+                    }
+                    if ((_rgb_source_buf[G] > tmp_average[G]) & (tmp_average[G] < 255)) {
+                        tmp_average[G] += ave_thresh;
+                    } else if ((_rgb_source_buf[G] < tmp_average[G]) & (tmp_average[G] > 0)) {
+                        tmp_average[G] -= ave_thresh;
+                    }
+                    if ((_rgb_source_buf[B] > tmp_average[B]) & (tmp_average[B] < 255)) {
+                        tmp_average[B] += ave_thresh;
+                    } else if ((_rgb_source_buf[B] < tmp_average[B]) & (tmp_average[B] > 0)) {
+                        tmp_average[B] -= ave_thresh;
+                    }
 
-            if (first_run) {
-                printf("%i ", *tmp_last);
-                *tmp_average = *tmp_last;
-            } else {
-                if ((*tmp_last > *tmp_average) & (*tmp_average < 255)) {
-                    *tmp_average += threshold;
-                } else if ((*tmp_last < *tmp_average) & (*tmp_average > 0)) {
-                    *tmp_average -= threshold;
+                    // difference between the average image and the current one for each colour.
+                    int r_diff = _rgb_source_buf[R] - tmp_average[R];
+                    int g_diff = _rgb_source_buf[G] - tmp_average[G];
+                    int b_diff = _rgb_source_buf[B] - tmp_average[B];
+
+                    // difference between the colours.
+                    // if all colours get brighter (or dimmer) by the same about, then val == 0.
+                    // only if some colours change more than others do we register a change.
+                    int col_change = abs(r_diff - g_diff) + abs(g_diff - b_diff) + abs(b_diff - r_diff);
+                    if (col_change > 255) { col_change = 255; }
+
+                    // difference in brightness of all 3 colours combined.
+                    int bright_change = abs(_rgb_source_buf[R] + _rgb_source_buf[G] + _rgb_source_buf[B] -
+                                            tmp_average[R] - tmp_average[G] - tmp_average[B]) / 3;
+
+                    if (col_change > mov_thresh && bright_change > mov_thresh) {
+                        //*tmp_movment = col_change;
+                        *tmp_movment = (_rgb_source_buf[R] + _rgb_source_buf[G] + _rgb_source_buf[B]) / 3;
+                    } else {
+                        *tmp_movment = 0;
+                    }
                 }
+                tmp_average += 3;
+                tmp_movment++;
             }
-
-            tmp_last++;
-            tmp_average++;
-            tmp_movment++;
+            _rgb_source_buf += 3;
         }
     }
 }
@@ -679,6 +713,7 @@ static void init_device(void)
         struct v4l2_cropcap cropcap;
         struct v4l2_crop crop;
         struct v4l2_format fmt;
+        struct v4l2_control control;
         unsigned int min;
 
         if (-1 == xioctl(fd, VIDIOC_QUERYCAP, &cap)) {
@@ -788,6 +823,33 @@ static void init_device(void)
 	capture_height = fmt.fmt.pix.height;
     fprintf(stderr,"Image width set to %i by device %s.\n", capture_width, dev_name);
     fprintf(stderr,"Image height set to %i by device %s.\n", capture_height, dev_name);
+
+    // Turn off anything that might auto-adjust the brightness/contrast.
+    // "$ v4l2-ctl -l" lets us see what our camera is capable of (and set to).
+    memset (&control, 0, sizeof (control));
+    control.id = V4L2_CID_AUTO_WHITE_BALANCE;
+    control.value = 0;
+    ioctl (fd, VIDIOC_S_CTRL, &control);    // Errors ignored
+    memset (&control, 0, sizeof (control));
+    control.id = V4L2_CID_RED_BALANCE;
+    control.value = 0;
+    ioctl (fd, VIDIOC_S_CTRL, &control);    // Errors ignored
+    memset (&control, 0, sizeof (control));
+    control.id = V4L2_CID_BLUE_BALANCE;
+    control.value = 0;
+    ioctl (fd, VIDIOC_S_CTRL, &control);    // Errors ignored
+    memset (&control, 0, sizeof (control));
+    control.id = V4L2_CID_AUTOGAIN;
+    control.value = 0;
+    ioctl (fd, VIDIOC_S_CTRL, &control);    // Errors ignored
+    memset (&control, 0, sizeof (control));
+    control.id = V4L2_CID_HUE_AUTO;
+    control.value = 0;
+    ioctl (fd, VIDIOC_S_CTRL, &control);    // Errors ignored
+    memset (&control, 0, sizeof (control));
+    control.id =  V4L2_CID_BACKLIGHT_COMPENSATION;
+    control.value = 0;
+    ioctl (fd, VIDIOC_S_CTRL, &control);    // Errors ignored
 }
 
 static void close_device(void)
@@ -835,12 +897,13 @@ static void usage(FILE *fp, int argc, char **argv)
                  "-u | --userp         Use application allocated buffers\n"
                  "-f | --format        Force format to 640x480 YUYV\n"
                  "-s | --scale         Raw image devided by this scale [%i]\n"
-                 "-t | --threshold     Rate at which changes in image are absorbed into the expected backround [%f]\n"
+                 "-a | --ave_thresh    Rate at which changes in image are absorbed into the expected backround [%f]\n"
+                 "-t | --mov_thresh    Sensitivity to movment. 0 = high sensitivity. 255 = no sensitivity [%i]\n"
                  "",
-                 argv[0], dev_name, scale, threshold);
+                 argv[0], dev_name, scale, ave_thresh, mov_thresh);
 }
 
-static const char short_options[] = "d:hmruofs:t:";
+static const char short_options[] = "d:hmruofs:a:t:";
 
 static const struct option
 long_options[] = {
@@ -851,13 +914,14 @@ long_options[] = {
         { "userp",  no_argument,       NULL, 'u' },
         { "format", no_argument,       NULL, 'f' },
         { "scale",  required_argument, NULL, 's' },
-        { "threshold", required_argument, NULL, 't' },
+        { "ave_thresh", required_argument, NULL, 'a' },
+        { "mov_thresh", required_argument, NULL, 't' },
         { 0, 0, 0, 0 }
 };
 
 int main(int argc, char **argv)
 {
-    clock_t begin, end;
+    struct timespec begin, end;
 
     dev_name = "/dev/video0";
 
@@ -909,8 +973,12 @@ int main(int argc, char **argv)
                 }
                 break;
 
+            case 'a':
+                ave_thresh = atof(optarg);
+                break;
+
             case 't':
-                threshold = atof(optarg);
+                mov_thresh = atof(optarg);
                 break;
 
             default:
@@ -923,22 +991,23 @@ int main(int argc, char **argv)
     init_device();
     init_buf();
     start_capturing();
-    begin = clock();
+    clock_gettime( CLOCK_REALTIME, &begin);
     while (1) {
         mainloop();
-        end = clock();
-        if ((float)(end - begin) / CLOCKS_PER_SEC > .1) {
-            begin = clock();
-            update_movment();
-            display_image(movment_buf);
+        clock_gettime( CLOCK_REALTIME, &end);
+        if ((end.tv_sec - begin.tv_sec) + ((double)(end.tv_nsec - begin.tv_nsec) / (double)BILLION) > 1) {
+            clock_gettime( CLOCK_REALTIME, &begin);
+            //fprintf(stderr, ".\n");
 
-            //YUV422toRGB888(capture_width, capture_height, last_buf, rgb_buf);
-            //write_JPEG_file(rgb_buf, "peep_webcam.jpeg", capture_width, capture_height, 3);
+            YUV422toRGB888(capture_width, capture_height, last_buf, rgb_buf);
+            update_movment(rgb_buf);
+
+            display_image(movment_buf);
             
-            //write_JPEG_file(simplified_buf, "peep_simple.jpeg", capture_width / scale, capture_height / scale, 1);
+            write_JPEG_file(rgb_buf, "peep_webcam.jpeg", capture_width, capture_height, 3);
             
-            //float_buf_to_char_buf(average_buf, average_char_buf, capture_width / scale, capture_height / scale, 1);
-            //write_JPEG_file(average_char_buf, "peep_average.jpeg", capture_width / scale, capture_height / scale, 1);
+            float_buf_to_char_buf(average_buf, average_char_buf, capture_width / scale, capture_height / scale, 3);
+            write_JPEG_file(average_char_buf, "peep_average.jpeg", capture_width / scale, capture_height / scale, 3);
             
             write_JPEG_file(movment_buf, "peep_movment.jpeg", capture_width / scale, capture_height / scale, 1);
 
