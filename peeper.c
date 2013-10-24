@@ -55,7 +55,8 @@ static unsigned int     n_buffers;
 static int              force_format;
 static int              scale = 16;
 static float            ave_thresh = 0.1;
-static int              mov_thresh = 20;
+static int              bright_thresh = 20;
+static int              col_thresh = 10;
 
 static int 			    capture_width = 0;
 static int			    capture_height = 0;
@@ -306,7 +307,7 @@ static void update_movment(unsigned char* _rgb_source_buf) {
                     int bright_change = abs(_rgb_source_buf[R] + _rgb_source_buf[G] + _rgb_source_buf[B] -
                                             tmp_average[R] - tmp_average[G] - tmp_average[B]) / 3;
 
-                    if (col_change > mov_thresh && bright_change > mov_thresh) {
+                    if (col_change > col_thresh && bright_change > bright_thresh) {
                         //*tmp_movment = col_change;
                         *tmp_movment = (_rgb_source_buf[R] + _rgb_source_buf[G] + _rgb_source_buf[B]) / 3;
                     } else {
@@ -850,6 +851,10 @@ static void init_device(void)
     control.id =  V4L2_CID_BACKLIGHT_COMPENSATION;
     control.value = 0;
     ioctl (fd, VIDIOC_S_CTRL, &control);    // Errors ignored
+    memset (&control, 0, sizeof (control));
+    control.id =  V4L2_EXPOSURE_AUTO;
+    control.value = 3;
+    ioctl (fd, VIDIOC_S_CTRL, &control);    // Errors ignored
 }
 
 static void close_device(void)
@@ -898,12 +903,15 @@ static void usage(FILE *fp, int argc, char **argv)
                  "-f | --format        Force format to 640x480 YUYV\n"
                  "-s | --scale         Raw image devided by this scale [%i]\n"
                  "-a | --ave_thresh    Rate at which changes in image are absorbed into the expected backround [%f]\n"
-                 "-t | --mov_thresh    Sensitivity to movment. 0 = high sensitivity. 255 = no sensitivity [%i]\n"
+                 "-b | --bright_thresh Sensitivity to movment. 0 = high sensitivity. 255 = no sensitivity [%i]\n"
+                 "                     Lower this if contrast is bad but colours are different.\n"
+                 "-c | --col_thresh    Sensitivity to movment. 0 = high sensitivity. 255 = no sensitivity [%i]\n"
+                 "                     Lower this if detected colours are similar to background.\n"
                  "",
-                 argv[0], dev_name, scale, ave_thresh, mov_thresh);
+                 argv[0], dev_name, scale, ave_thresh, bright_thresh, col_thresh);
 }
 
-static const char short_options[] = "d:hmruofs:a:t:";
+static const char short_options[] = "d:hmruofs:a:b:c:";
 
 static const struct option
 long_options[] = {
@@ -915,7 +923,8 @@ long_options[] = {
         { "format", no_argument,       NULL, 'f' },
         { "scale",  required_argument, NULL, 's' },
         { "ave_thresh", required_argument, NULL, 'a' },
-        { "mov_thresh", required_argument, NULL, 't' },
+        { "bright_thresh", required_argument, NULL, 'b' },
+        { "col_thresh", required_argument, NULL, 'c' },
         { 0, 0, 0, 0 }
 };
 
@@ -977,8 +986,12 @@ int main(int argc, char **argv)
                 ave_thresh = atof(optarg);
                 break;
 
-            case 't':
-                mov_thresh = atof(optarg);
+            case 'b':
+                bright_thresh = atof(optarg);
+                break;
+
+            case 'c':
+                col_thresh = atof(optarg);
                 break;
 
             default:
@@ -995,7 +1008,7 @@ int main(int argc, char **argv)
     while (1) {
         mainloop();
         clock_gettime( CLOCK_REALTIME, &end);
-        if ((end.tv_sec - begin.tv_sec) + ((double)(end.tv_nsec - begin.tv_nsec) / (double)BILLION) > 1) {
+        if ((end.tv_sec - begin.tv_sec) + ((double)(end.tv_nsec - begin.tv_nsec) / (double)BILLION) > 0.1) {
             clock_gettime( CLOCK_REALTIME, &begin);
             //fprintf(stderr, ".\n");
 
