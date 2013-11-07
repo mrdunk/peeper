@@ -3,6 +3,8 @@
  * http://linuxtv.org/downloads/v4l-dvb-apis/capture-example.html
  *
  * Works with v4l2 compatible webcam. (Not v4l.)
+ *
+ * $ gcc ./peeper.c ./jpeg.c -ljpeg -lrt -Wall
  */
 
 #include <stdio.h>
@@ -22,8 +24,7 @@
 #include <sys/ioctl.h>
 #include <time.h>
 
-#include "jpeglib.h"
-
+#include "jpeg.h"
 
 #include <linux/videodev2.h>
 
@@ -45,6 +46,16 @@ struct buffer {
         size_t  length;
 };
 
+struct screen_buf {
+        void*           start;
+        size_t          length;
+        int             width;
+        int             height;
+        pthread_mutex_t lock;
+};
+
+static struct screen_buf last_frame;
+
 static char            *dev_name;
 static enum io_method   io = IO_METHOD_MMAP;
 static int              fd = -1;
@@ -63,39 +74,12 @@ static int			    capture_height = 0;
 static int              first_run = 1;
 
 // Data containers
-static unsigned char*   last_buf;               // Last sucessfull read from webcam.
+//static unsigned char*   last_buf;               // Last sucessfull read from webcam.
 static float*           average_buf;            // Average monochrome image over last several frames.
 static unsigned char*   average_char_buf;       // unsigned char buffer with average_buf data in it.
 static unsigned char*   movment_buf;            // Diff between rgb_buf and average_buf.
-static unsigned char*   rgb_buf;                // last_buf converted to RGB colours.
+//static unsigned char*   rgb_buf;                // last_buf converted to RGB colours.
 
-
-#include <openssl/sha.h>
-#include <openssl/hmac.h>
-#include <openssl/evp.h>
-#include <openssl/bio.h>
-#include <openssl/buffer.h>
-// http://www.ioncannon.net/programming/34/howto-base64-encode-with-cc-and-openssl/
-char *base64(const unsigned char *input, int length)
-{
-    BIO *bmem, *b64;
-    BUF_MEM *bptr;
-
-    b64 = BIO_new(BIO_f_base64());
-    bmem = BIO_new(BIO_s_mem());
-    b64 = BIO_push(b64, bmem);
-    BIO_write(b64, input, length);
-    BIO_flush(b64);
-    BIO_get_mem_ptr(b64, &bptr);
-
-    char *buff = (char *)malloc(bptr->length);
-    memcpy(buff, bptr->data, bptr->length-1);
-    buff[bptr->length-1] = 0;
-
-    BIO_free_all(b64);
-
-    return buff;
-}
 
 /**
   Convert from YUV422 format to RGB888. Formulae are described on http://en.wikipedia.org/wiki/YUV
@@ -137,7 +121,7 @@ static void YUV422toRGB888(int width, int height, unsigned char *src, unsigned c
   }
 }
 
-static void float_buf_to_char_buf (float* float_buf, unsigned char* char_buf, int image_width, int image_height, int num_of_col)
+static void float_buf_to_char_buf(float* float_buf, unsigned char* char_buf, int image_width, int image_height, int num_of_col)
 {
     int i = 0;
     while (i < image_width * image_height * num_of_col) {
@@ -152,59 +136,6 @@ static void float_buf_to_char_buf (float* float_buf, unsigned char* char_buf, in
     }
 }
 
-static void write_JPEG_file (unsigned char* p_image_buffer, char* filename, int image_width, int image_height, int num_of_col)
-{
-    // JPEG object
-    struct jpeg_compress_struct cinfo;
-
-    // JPEG error handler
-    struct jpeg_error_mgr jerr;
-    cinfo.err = jpeg_std_error(&jerr);
-
-    JSAMPROW row_pointer[1];      /* pointer to JSAMPLE row[s] */
-
-    // initialize the JPEG compression object.
-    jpeg_create_compress(&cinfo);
-
-    // open file and set file as target.
-    FILE * outfile;               /* target file */
-    if ((outfile = fopen(filename, "wb")) == NULL) {
-        fprintf(stderr, "can't open %s\n", filename);
-        exit(1);
-    }
-    jpeg_stdio_dest(&cinfo, outfile);
-    //unsigned char *mem = NULL;
-    //unsigned long mem_size = 0;
-    //jpeg_mem_dest(&cinfo, &mem, &mem_size);
-
-    cinfo.image_width = image_width;      /* image width and height, in pixels */
-    cinfo.image_height = image_height;
-    cinfo.input_components = num_of_col;  /* # of color components per pixel */
-    if (num_of_col == 3){
-        cinfo.in_color_space = JCS_RGB;       /* colorspace of input image */
-    } else {
-        cinfo.in_color_space = JCS_GRAYSCALE;
-    }
-
-    // set other cinfo peramiters as default.
-    jpeg_set_defaults(&cinfo);
-
-    // set any non default cinfo oeramiters.
-    jpeg_set_quality(&cinfo, 70, TRUE /* limit to baseline-JPEG values */);
-
-    jpeg_start_compress(&cinfo, TRUE);
-    int row_stride = image_width * num_of_col;
-    while (cinfo.next_scanline < cinfo.image_height) {
-        row_pointer[0] = &p_image_buffer[cinfo.next_scanline * row_stride];
-        (void) jpeg_write_scanlines(&cinfo, row_pointer, 1);
-    }
-
-    jpeg_finish_compress(&cinfo);
-    fclose(outfile);
-    //free(mem);
-    jpeg_destroy_compress(&cinfo);
-}
-
 static void errno_exit(const char *s)
 {
         fprintf(stderr, "%s error %d, %s\n", s, errno, strerror(errno));
@@ -214,7 +145,9 @@ static void errno_exit(const char *s)
 static void process_image(const void *p, int size)
 {   
     // Save pointer to last sucessfully filled v4l2 buffer.
-    last_buf = (unsigned char*)p;
+    last_frame.start = (void*)p;
+    last_frame.width = capture_width;
+    last_frame.height = capture_height;
 }
 
 static int xioctl(int fh, int request, void *arg)
@@ -245,11 +178,11 @@ static void init_buf()
         fprintf(stderr, "Out of memory\n");
         exit(EXIT_FAILURE);
     }
-    rgb_buf = malloc(sizeof(unsigned char) * capture_width * capture_height * 3);
-    if (!rgb_buf) {
-        fprintf(stderr, "Out of memory\n");
-        exit(EXIT_FAILURE);
-    }
+//    rgb_buf = malloc(sizeof(unsigned char) * capture_width * capture_height * 3);
+//    if (!rgb_buf) {
+//        fprintf(stderr, "Out of memory\n");
+//        exit(EXIT_FAILURE);
+//    }
 
 }
 
@@ -258,7 +191,7 @@ static void uninit_buf()
     free(average_buf);
     free(average_char_buf);
     free(movment_buf);
-    free(rgb_buf);
+//    free(rgb_buf);
 }
 
 static void update_movment(unsigned char* _rgb_source_buf) {
@@ -384,44 +317,44 @@ static int read_frame(void)
         unsigned int i;
 
         switch (io) {
-        case IO_METHOD_READ:
+            case IO_METHOD_READ:
                 if (-1 == read(fd, buffers[0].start, buffers[0].length)) {
-                        switch (errno) {
+                    switch (errno) {
                         case EAGAIN:
-                                return 0;
+                            return 0;
 
                         case EIO:
-                                /* Could ignore EIO, see spec. */
+                            /* Could ignore EIO, see spec. */
 
-                                /* fall through */
+                            /* fall through */
 
                         default:
-                                errno_exit("read");
-                        }
+                            errno_exit("read");
+                    }
                 }
 
                 process_image(buffers[0].start, buffers[0].length);
                 break;
 
-        case IO_METHOD_MMAP:
+            case IO_METHOD_MMAP:
                 CLEAR(buf);
 
                 buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
                 buf.memory = V4L2_MEMORY_MMAP;
 
                 if (-1 == xioctl(fd, VIDIOC_DQBUF, &buf)) {
-                        switch (errno) {
+                    switch (errno) {
                         case EAGAIN:
-                                return 0;
+                            return 0;
 
                         case EIO:
-                                /* Could ignore EIO, see spec. */
+                            /* Could ignore EIO, see spec. */
 
-                                /* fall through */
+                            /* fall through */
 
                         default:
-                                errno_exit("VIDIOC_DQBUF");
-                        }
+                            errno_exit("VIDIOC_DQBUF");
+                    }
                 }
 
                 assert(buf.index < n_buffers);
@@ -429,41 +362,38 @@ static int read_frame(void)
                 process_image(buffers[buf.index].start, buf.bytesused);
 
                 if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
-                        errno_exit("VIDIOC_QBUF");
+                    errno_exit("VIDIOC_QBUF");
                 break;
 
-        case IO_METHOD_USERPTR:
+            case IO_METHOD_USERPTR:
                 CLEAR(buf);
 
                 buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
                 buf.memory = V4L2_MEMORY_USERPTR;
 
                 if (-1 == xioctl(fd, VIDIOC_DQBUF, &buf)) {
-                        switch (errno) {
+                    switch (errno) {
                         case EAGAIN:
-                                return 0;
-
+                            return 0;
                         case EIO:
-                                /* Could ignore EIO, see spec. */
-
-                                /* fall through */
-
+                            /* Could ignore EIO, see spec. */
+                            /* fall through */
                         default:
-                                errno_exit("VIDIOC_DQBUF");
-                        }
+                            errno_exit("VIDIOC_DQBUF");
+                    }
                 }
 
                 for (i = 0; i < n_buffers; ++i)
-                        if (buf.m.userptr == (unsigned long)buffers[i].start
+                    if (buf.m.userptr == (unsigned long)buffers[i].start
                             && buf.length == buffers[i].length)
-                                break;
+                        break;
 
                 assert(i < n_buffers);
 
                 process_image((void *)buf.m.userptr, buf.bytesused);
 
                 if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
-                        errno_exit("VIDIOC_QBUF");
+                    errno_exit("VIDIOC_QBUF");
                 break;
         }
 
@@ -889,6 +819,27 @@ static void open_device(void)
         }
 }
 
+void get_rgb(struct screen_buf* rgb_out){
+    if(rgb_out->length == 0){
+        rgb_out->start = malloc(sizeof(unsigned char) * last_frame.width * last_frame.height * 3);
+    } else if(rgb_out->length < sizeof(unsigned char) * last_frame.width * last_frame.height * 3){
+        rgb_out->length = sizeof(unsigned char) * last_frame.width * last_frame.height * 3;
+        rgb_out->start = realloc(rgb_out->start, rgb_out->length);
+    }
+    if(!rgb_out->start){
+        fprintf(stderr, "Memory error!");
+        exit(1);
+    }
+    rgb_out->width = last_frame.width;
+    rgb_out->height = last_frame.height;
+    
+    YUV422toRGB888(last_frame.width, last_frame.height, last_frame.start, rgb_out->start);    
+}
+
+void get_jpeg(){
+
+}
+
 static void usage(FILE *fp, int argc, char **argv)
 {
         fprintf(fp,
@@ -1000,6 +951,15 @@ int main(int argc, char **argv)
         }
     }
 
+    last_frame.width = capture_width;
+    last_frame.height = capture_height;
+    last_frame.start = 0;
+    last_frame.length = 0;
+
+    struct screen_buf rgb_frame;
+    rgb_frame.start = 0;
+    rgb_frame.length = 0;
+
     open_device();
     init_device();
     init_buf();
@@ -1011,18 +971,18 @@ int main(int argc, char **argv)
         if ((end.tv_sec - begin.tv_sec) + ((double)(end.tv_nsec - begin.tv_nsec) / (double)BILLION) > 0.1) {
             clock_gettime( CLOCK_REALTIME, &begin);
             //fprintf(stderr, ".\n");
-
-            YUV422toRGB888(capture_width, capture_height, last_buf, rgb_buf);
-            update_movment(rgb_buf);
-
+            //YUV422toRGB888(capture_width, capture_height, last_frame.start, rgb_buf);
+            get_rgb(&rgb_frame);
+            
+            //update_movment(rgb_buf);
+            update_movment(rgb_frame.start);
             display_image(movment_buf);
+            write_JPEG_file("peep_webcam.jpeg", rgb_frame.start, rgb_frame.width, rgb_frame.height, 3);
             
-            write_JPEG_file(rgb_buf, "peep_webcam.jpeg", capture_width, capture_height, 3);
+            //float_buf_to_char_buf(average_buf, average_char_buf, capture_width / scale, capture_height / scale, 3);
+            //write_JPEG_file("peep_average.jpeg", average_char_buf, capture_width / scale, capture_height / scale, 3);
             
-            float_buf_to_char_buf(average_buf, average_char_buf, capture_width / scale, capture_height / scale, 3);
-            write_JPEG_file(average_char_buf, "peep_average.jpeg", capture_width / scale, capture_height / scale, 3);
-            
-            write_JPEG_file(movment_buf, "peep_movment.jpeg", capture_width / scale, capture_height / scale, 1);
+            //write_JPEG_file("peep_movment.jpeg", movment_buf, capture_width / scale, capture_height / scale, 1);
 
             first_run = 0;
         }
